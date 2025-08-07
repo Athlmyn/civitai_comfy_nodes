@@ -218,11 +218,12 @@ class CivitAI_Model:
                             for chunk in response.iter_content(chunk_size=chunk_size):
                                 file.write(chunk)
                                 chunk_len = len(chunk)
-                                comfy_pbar.update(chunk_len)
                                 downloaded_bytes += chunk_len
                                 
                                 # Update total downloaded bytes
                                 total_downloaded[0] += chunk_len
+                                
+                                # Update progress (both tqdm and ComfyUI will be handled in update_progress_func)
                                 update_progress_func()
                                 
                                 retries = 0
@@ -333,15 +334,24 @@ class CivitAI_Model:
             # Track total downloaded bytes across all chunks
             total_downloaded = [0]  # Use list to allow modification in nested function
             last_percentage = [0]  # Track last displayed percentage to avoid unnecessary updates
+            last_comfy_percentage = [0]  # Track last ComfyUI progress percentage
             
             def update_overall_progress():
-                overall_percentage = int((total_downloaded[0] / total_file_size) * 100)
+                current_percentage = int((total_downloaded[0] / total_file_size) * 100)
                 # Only update if percentage has changed by at least 1%
-                if overall_percentage > last_percentage[0]:
-                    last_percentage[0] = overall_percentage
-                    total_pbar.n = overall_percentage
-                    total_pbar.set_postfix_str(f"{overall_percentage}% ({total_downloaded[0]}/{total_file_size} bytes)")
+                if current_percentage > last_percentage[0]:
+                    last_percentage[0] = current_percentage
+                    total_pbar.n = current_percentage
+                    total_pbar.set_postfix_str(f"{current_percentage}% ({total_downloaded[0]}/{total_file_size} bytes)")
                     total_pbar.refresh()
+                
+                # Update ComfyUI progress bar only when percentage changes
+                if current_percentage > last_comfy_percentage[0]:
+                    # Calculate bytes for the percentage increase
+                    percentage_diff = current_percentage - last_comfy_percentage[0]
+                    bytes_to_add = percentage_diff * (total_file_size // 100)
+                    comfy_pbar.update(bytes_to_add)
+                    last_comfy_percentage[0] = current_percentage
             
             for i in range(self.num_chunks):
                 start_byte = i * (total_file_size // self.num_chunks)
@@ -354,11 +364,16 @@ class CivitAI_Model:
             for future in futures:
                 future.result()
                 
-            # Final progress update
+            # Final progress update - ensure both progress bars reach 100%
             total_pbar.n = 100
             total_pbar.set_postfix_str("100% (Download Complete)")
             total_pbar.refresh()
             total_pbar.close()
+            
+            # Ensure ComfyUI progress bar reaches 100%
+            remaining_bytes = total_file_size - (last_comfy_percentage[0] * (total_file_size // 100))
+            if remaining_bytes > 0:
+                comfy_pbar.update(remaining_bytes)
         model_sha256 = CivitAI_Model.calculate_sha256(save_path)
         if model_sha256 == self.file_sha256:
             print(f"{MSG_PREFIX}Loading {self.type}: {self.name} (https://civitai.com/models/{self.model_id}/?modelVersionId={self.version})")
