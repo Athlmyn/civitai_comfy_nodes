@@ -198,7 +198,7 @@ class CivitAI_Model:
     
         # DOWNLAOD BYTE CHUNK
         
-        def download_chunk(chunk_id, url, chunk_size, start_byte, end_byte, file_path, total_pbar, comfy_pbar, max_retries=30):
+        def download_chunk(chunk_id, url, chunk_size, start_byte, end_byte, file_path, total_pbar, comfy_pbar, total_file_size, total_downloaded, update_progress_func, max_retries=30):
             retries = 0
             retry_delay = 5
             chunk_complete = False
@@ -212,28 +212,32 @@ class CivitAI_Model:
                         with open(file_path, 'r+b') as file:
                             if retries > 0:
                                 print(f"{MSG_PREFIX}Chunk {chunk_id} re-established in {retry_delay}s")
-                                total_pbar.update()
                                 time.sleep(retry_delay * 10)
-                                total_pbar.set_postfix_str('')
 
                             file.seek(start_byte + downloaded_bytes) 
                             for chunk in response.iter_content(chunk_size=chunk_size):
                                 file.write(chunk)
-                                total_pbar.update(len(chunk))
-                                comfy_pbar.update(len(chunk))
-                                downloaded_bytes += len(chunk)
+                                chunk_len = len(chunk)
+                                comfy_pbar.update(chunk_len)
+                                downloaded_bytes += chunk_len
+                                
+                                # Update total downloaded bytes
+                                total_downloaded[0] += chunk_len
+                                update_progress_func()
+                                
                                 retries = 0
                                 if start_byte + downloaded_bytes >= end_byte:
                                     chunk_complete = True
                                     break
 
-                            comfy_pbar.set_postfix_str(f"Chunk {chunk_id}: {downloaded_bytes} bytes downloaded")
+                            # Calculate percentage for this chunk
+                            chunk_progress = int((downloaded_bytes / (end_byte - start_byte + 1)) * 100)
+                            print(f"{MSG_PREFIX}Chunk {chunk_id}: {chunk_progress}% completed")
                     else:
                         raise Exception(f"{ERR_PREFIX}Unable to establish download connection.")
                 except (requests.exceptions.RequestException, Exception) as e:
                     # We shouldn't warn on chunk loss, since end chunks may not be able to be established due to remaining filesize
                     #print(f"{WARN_PREFIX}Chunk {chunk_id} connection lost") 
-                    total_pbar.update()
                     time.sleep(retry_delay)
                     retries += 1
                     if retries > max_retries:
@@ -292,6 +296,7 @@ class CivitAI_Model:
         # NO MODEL FOUND! | DOWNLOAD MODEL FROM CIVITAI
 
         print(f"{MSG_PREFIX}Downloading `{self.name}` from `{self.download_url}`")
+        print(f"{MSG_PREFIX}Progress will be displayed as percentage completed")
         save_path = os.path.join(self.model_path, self.name) # Assume default comfy folder, unless we take user input on extra paths
         
         # EXISTING MODEL FOUND -- CHECK SHA256
@@ -321,20 +326,38 @@ class CivitAI_Model:
 
         futures = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_chunks) as executor:
-            total_pbar = tqdm(total=total_file_size, unit='B', unit_scale=True, unit_divisor=1024, leave=True)
+            total_pbar = tqdm(total=100, unit='%', desc="Progress")
             comfy_pbar = comfy.utils.ProgressBar(total_file_size)
             comfy_pbar.update(0)
+            
+            # Track total downloaded bytes across all chunks
+            total_downloaded = [0]  # Use list to allow modification in nested function
+            last_percentage = [0]  # Track last displayed percentage to avoid unnecessary updates
+            
+            def update_overall_progress():
+                overall_percentage = int((total_downloaded[0] / total_file_size) * 100)
+                # Only update if percentage has changed by at least 1%
+                if overall_percentage > last_percentage[0]:
+                    last_percentage[0] = overall_percentage
+                    total_pbar.n = overall_percentage
+                    total_pbar.set_postfix_str(f"{overall_percentage}% ({total_downloaded[0]}/{total_file_size} bytes)")
+                    total_pbar.refresh()
+            
             for i in range(self.num_chunks):
                 start_byte = i * (total_file_size // self.num_chunks)
                 end_byte = start_byte + (total_file_size // self.num_chunks) - 1
                 if i == self.num_chunks - 1:
                     end_byte = total_file_size - 1
-                future = executor.submit(download_chunk, i, self.download_url, self.chunk_size, start_byte, end_byte, save_path, total_pbar, comfy_pbar, self.max_retries)
+                future = executor.submit(download_chunk, i, self.download_url, self.chunk_size, start_byte, end_byte, save_path, total_pbar, comfy_pbar, total_file_size, total_downloaded, update_overall_progress, self.max_retries)
                 futures.append(future)
 
             for future in futures:
                 future.result()
                 
+            # Final progress update
+            total_pbar.n = 100
+            total_pbar.set_postfix_str("100% (Download Complete)")
+            total_pbar.refresh()
             total_pbar.close()
         model_sha256 = CivitAI_Model.calculate_sha256(save_path)
         if model_sha256 == self.file_sha256:
